@@ -67,7 +67,11 @@ pub fn alloc_audio_backend(
         #[cfg(all(feature = "alsa-backend", target_env = "gnu"))]
         BackendType::Alsa => Ok(Box::new(AlsaBackend::new(streams))),
         #[cfg(all(feature = "gst-backend", target_env = "gnu"))]
-        BackendType::GStreamer => Ok(Box::new(GStreamerBackend::new(streams))),
+        BackendType::GStreamer => {
+            Ok(Box::new(GStreamerBackend::new(streams).map_err(|err| {
+                crate::Error::UnexpectedAudioBackendError(err.into())
+            })?))
+        }
     }
 }
 

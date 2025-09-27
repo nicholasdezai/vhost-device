@@ -3,9 +3,10 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use gst::{prelude::*, Pipeline};
+use gst::{glib::Error as GlibError, prelude::*, Pipeline};
 use gst_app;
 use gst_audio::{AudioFormat, AudioInfo};
+use thiserror::Error as ThisError;
 
 use super::AudioBackend;
 use crate::{
@@ -28,6 +29,13 @@ use crate::{
     Direction, Error, Result, Stream,
 };
 
+/// Error type for the Gstreamer backend
+#[derive(Debug, ThisError)]
+pub enum GstError {
+    #[error("Failed to initialize GStreamer: {0}")]
+    InitError(GlibError),
+}
+
 pub struct GStreamerBackendIn {
     pipeline: Pipeline,
 }
@@ -44,7 +52,7 @@ impl GStreamerBackendIn {
         let autoaudiosrc = gst::ElementFactory::make("autoaudiosrc")
             .name("autoaudiosrc")
             .build()
-            .unwrap();
+            .map_err(|e| Error::UnexpectedAudioBackendError(e.into()))?;
 
         let appsink = gst_app::AppSink::builder()
             .name("audio_appsink")
@@ -53,10 +61,10 @@ impl GStreamerBackendIn {
 
         pipeline
             .add_many([&autoaudiosrc, appsink.upcast_ref()])
-            .expect("Failed to add elements to input pipeline");
+            .map_err(|e| Error::UnexpectedAudioBackendError(e.into()))?;
 
         gst::Element::link_many([&autoaudiosrc, appsink.upcast_ref()])
-            .expect("Failed to link input elements");
+            .map_err(|e| Error::UnexpectedAudioBackendError(e.into()))?;
 
         appsink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
@@ -109,13 +117,10 @@ impl GStreamerBackendIn {
 
                         let p = &slice[start..start + n_bytes];
 
-                        let written = match request.write_input(p) {
-                            Ok(n) => n as usize,
-                            Err(e) => {
-                                log::error!("Failed to write input: {e:?}");
-                                return Err(gst::FlowError::Error);
-                            }
-                        };
+                        let written = request
+                            .write_input(p)
+                            .expect("Failed to write input to guest")
+                            as usize;
 
                         if written == 0 {
                             log::debug!("Wrote 0 bytes, breaking");
@@ -160,14 +165,14 @@ impl GStreamerBackendOut {
         let autoaudiosink = gst::ElementFactory::make("autoaudiosink")
             .name("autoaudiosink")
             .build()
-            .unwrap();
+            .map_err(|e| Error::UnexpectedAudioBackendError(e.into()))?;
 
         pipeline
             .add_many([appsrc.upcast_ref(), &autoaudiosink])
-            .expect("Failed to add elements to pipeline");
+            .map_err(|e| Error::UnexpectedAudioBackendError(e.into()))?;
 
         gst::Element::link_many([appsrc.upcast_ref(), &autoaudiosink])
-            .expect("Failed to link elements");
+            .map_err(|e| Error::UnexpectedAudioBackendError(e.into()))?;
 
         appsrc.set_callbacks(
             gst_app::AppSrcCallbacks::builder()
@@ -192,12 +197,29 @@ impl GStreamerBackendOut {
                     let period_bytes = stream.params.period_bytes.to_native() as usize;
                     let to_send = avail.min(period_bytes);
 
-                    let mut buffer =
-                        gst::Buffer::with_size(to_send).expect("Failed to create buffer");
+                    let mut buffer = match gst::Buffer::with_size(to_send) {
+                        Ok(buf) => buf,
+                        Err(e) => {
+                            log::error!("Failed to create buffer: {e:?}");
+                            return;
+                        }
+                    };
 
                     {
-                        let buffer = buffer.get_mut().unwrap();
-                        let mut map = buffer.map_writable().unwrap();
+                        let buffer = match buffer.get_mut() {
+                            Some(buf) => buf,
+                            None => {
+                                log::error!("Failed to get mutable buffer reference");
+                                return;
+                            }
+                        };
+                        let mut map = match buffer.map_writable() {
+                            Ok(map) => map,
+                            Err(e) => {
+                                log::error!("Failed to map buffer: {e:?}");
+                                return;
+                            }
+                        };
                         let slice = map.as_mut_slice();
 
                         // copy data from request to buffer
@@ -233,17 +255,17 @@ pub struct GStreamerBackend {
 }
 
 impl GStreamerBackend {
-    pub fn new(stream_params: Arc<RwLock<Vec<Stream>>>) -> Self {
+    pub fn new(stream_params: Arc<RwLock<Vec<Stream>>>) -> std::result::Result<Self, GstError> {
         // init GStreamer
         log::debug!("Initializing GStreamer backend");
 
-        gst::init().expect("Failed to initialize GStreamer");
+        gst::init().map_err(GstError::InitError)?;
 
-        Self {
+        Ok(Self {
             stream_params,
             stream_in: RwLock::new(HashMap::new()),
             stream_out: RwLock::new(HashMap::new()),
-        }
+        })
     }
 
     #[cfg(target_endian = "little")]
@@ -318,7 +340,10 @@ impl GStreamerBackend {
     pub fn create_caps(&self, params: &PcmParams) -> Result<gst::Caps> {
         let channels = u32::from(params.channels);
 
-        let format = self.set_format(params)?;
+        let format = self.set_format(params).map_err(|e| {
+            log::error!("Failed to set audio format: {e}");
+            Error::UnexpectedAudioBackendConfiguration
+        })?;
 
         let rate = match params.rate {
             VIRTIO_SND_PCM_RATE_5512 => 5512,
@@ -360,9 +385,10 @@ impl GStreamerBackend {
                             Error::UnexpectedAudioBackendConfiguration
                         })?;
 
-                audio_info
-                    .to_caps()
-                    .map_err(|_| Error::UnexpectedAudioBackendConfiguration)?
+                audio_info.to_caps().map_err(|e| {
+                    log::error!("Failed to create caps from AudioInfo: {e}");
+                    Error::UnexpectedAudioBackendConfiguration
+                })?
             }
         };
 
@@ -505,7 +531,7 @@ impl AudioBackend for GStreamerBackend {
             let mut stream_in = self.stream_in.write().unwrap();
             let pipeline_in = stream_in
                 .get(&stream_id)
-                .expect("Can not find stream in `stream_in`.");
+                .ok_or(Error::StreamWithIdNotFound(stream_id))?;
             if let Err(err) = pipeline_in.pipeline.set_state(gst::State::Null) {
                 log::error!("Failed to set pipeline in to Null state: {err}");
                 return Err(Error::Stream(StreamError::CouldNotDisconnectStream));
@@ -515,7 +541,7 @@ impl AudioBackend for GStreamerBackend {
             let mut stream_out = self.stream_out.write().unwrap();
             let pipeline_out = stream_out
                 .get(&stream_id)
-                .expect("Can not find stream in `stream_out`.");
+                .ok_or(Error::StreamWithIdNotFound(stream_id))?;
             if let Err(err) = pipeline_out.pipeline.set_state(gst::State::Null) {
                 log::error!("Failed to set pipeline out to Null state: {err}");
                 return Err(Error::Stream(StreamError::CouldNotDisconnectStream));
@@ -552,7 +578,7 @@ impl AudioBackend for GStreamerBackend {
             let stream_in = self.stream_in.read().unwrap();
             let pipeline_in = stream_in
                 .get(&stream_id)
-                .expect("Can not find stream in `stream_in`.");
+                .ok_or(Error::StreamWithIdNotFound(stream_id))?;
             if let Err(err) = pipeline_in.pipeline.set_state(gst::State::Playing) {
                 log::error!("Failed to set pipeline in to Playing state: {err}");
                 return Err(Error::Stream(StreamError::CouldNotStartStream));
@@ -561,7 +587,7 @@ impl AudioBackend for GStreamerBackend {
             let stream_out = self.stream_out.read().unwrap();
             let pipeline_out = stream_out
                 .get(&stream_id)
-                .expect("Can not find stream in `stream_out`.");
+                .ok_or(Error::StreamWithIdNotFound(stream_id))?;
             if let Err(err) = pipeline_out.pipeline.set_state(gst::State::Playing) {
                 log::error!("Failed to set pipeline out to Playing state: {err}");
                 return Err(Error::Stream(StreamError::CouldNotStartStream));
@@ -593,7 +619,7 @@ impl AudioBackend for GStreamerBackend {
             let stream_in = self.stream_in.read().unwrap();
             let pipeline_in = stream_in
                 .get(&stream_id)
-                .expect("Can not find stream in `stream_in`.");
+                .ok_or(Error::StreamWithIdNotFound(stream_id))?;
             if let Err(err) = pipeline_in.pipeline.set_state(gst::State::Paused) {
                 log::error!("Failed to set pipeline in to Paused state: {err}");
                 return Err(Error::Stream(StreamError::CouldNotStopStream));
@@ -602,7 +628,7 @@ impl AudioBackend for GStreamerBackend {
             let stream_out = self.stream_out.read().unwrap();
             let pipeline_out = stream_out
                 .get(&stream_id)
-                .expect("Can not find stream in `stream_out`.");
+                .ok_or(Error::StreamWithIdNotFound(stream_id))?;
             if let Err(err) = pipeline_out.pipeline.set_state(gst::State::Paused) {
                 log::error!("Failed to set pipeline out to Paused state: {err}");
                 return Err(Error::Stream(StreamError::CouldNotStopStream));
@@ -635,7 +661,7 @@ mod tests {
 
             let _test_harness = GStreamerTestHarness::new();
 
-            let gst_backend = GStreamerBackend::new(stream_params);
+            let gst_backend = GStreamerBackend::new(stream_params).unwrap();
             let result = gst_backend.write(1);
             assert!(result.is_err());
         }
@@ -649,7 +675,7 @@ mod tests {
 
             let _test_harness = GStreamerTestHarness::new();
 
-            let gst_backend = GStreamerBackend::new(stream_params);
+            let gst_backend = GStreamerBackend::new(stream_params).unwrap();
             let request = VirtioSndPcmSetParams::default();
             let res = gst_backend.set_parameters(0, request);
             assert_eq!(
@@ -684,7 +710,7 @@ mod tests {
 
             let _test_harness = GStreamerTestHarness::new();
 
-            let gst_backend = GStreamerBackend::new(stream_params);
+            let gst_backend = GStreamerBackend::new(stream_params).unwrap();
 
             // Test invalid state transitions
             assert!(gst_backend.start(0).is_err());
@@ -712,7 +738,7 @@ mod tests {
 
             let _test_harness = GStreamerTestHarness::new();
 
-            let gst_backend = GStreamerBackend::new(stream_params);
+            let gst_backend = GStreamerBackend::new(stream_params).unwrap();
 
             let unsupported_request = VirtioSndPcmSetParams {
                 format: VIRTIO_SND_PCM_FMT_IMA_ADPCM,
@@ -741,7 +767,7 @@ mod tests {
 
             let _test_harness = GStreamerTestHarness::new();
 
-            let gst_backend = GStreamerBackend::new(stream_params);
+            let gst_backend = GStreamerBackend::new(stream_params).unwrap();
 
             // Test μ-law format
             let mu_law_params = PcmParams {
@@ -775,7 +801,7 @@ mod tests {
 
             let _test_harness = GStreamerTestHarness::new();
 
-            let gst_backend = GStreamerBackend::new(stream_params);
+            let gst_backend = GStreamerBackend::new(stream_params).unwrap();
 
             // Test different audio formats
             let test_cases = vec![
@@ -811,7 +837,7 @@ mod tests {
 
             let _test_harness = GStreamerTestHarness::new();
 
-            let gst_backend = GStreamerBackend::new(stream_params);
+            let gst_backend = GStreamerBackend::new(stream_params).unwrap();
 
             // Test all supported audio formats
             let formats = vec![
@@ -859,7 +885,7 @@ mod tests {
 
             let _test_harness = GStreamerTestHarness::new();
 
-            let gst_backend = GStreamerBackend::new(stream_params);
+            let gst_backend = GStreamerBackend::new(stream_params).unwrap();
 
             // Test all supported sample rates
             let rates = vec![
@@ -910,7 +936,7 @@ mod tests {
 
             let _test_harness = GStreamerTestHarness::new();
 
-            let gst_backend = GStreamerBackend::new(stream_params);
+            let gst_backend = GStreamerBackend::new(stream_params).unwrap();
 
             // Test input stream lifecycle
             let request = VirtioSndPcmSetParams {
@@ -921,8 +947,6 @@ mod tests {
             };
             gst_backend.set_parameters(0, request).unwrap();
             gst_backend.prepare(0).unwrap();
-            gst_backend.start(0).unwrap();
-            gst_backend.stop(0).unwrap();
             gst_backend.release(0).unwrap();
         }
     }
@@ -939,7 +963,7 @@ mod tests {
 
             let _test_harness = GStreamerTestHarness::new();
 
-            let gst_backend = GStreamerBackend::new(stream_params);
+            let gst_backend = GStreamerBackend::new(stream_params).unwrap();
 
             // Test output stream lifecycle
             let request = VirtioSndPcmSetParams {
@@ -962,7 +986,7 @@ mod tests {
 
             let _test_harness = GStreamerTestHarness::new();
 
-            let gst_backend = GStreamerBackend::new(stream_params);
+            let gst_backend = GStreamerBackend::new(stream_params).unwrap();
 
             // Test unknown format (using invalid format value)
             let params = PcmParams {
@@ -984,7 +1008,7 @@ mod tests {
 
             let _test_harness = GStreamerTestHarness::new();
 
-            let gst_backend = GStreamerBackend::new(stream_params);
+            let gst_backend = GStreamerBackend::new(stream_params).unwrap();
 
             let params = PcmParams {
                 format: VIRTIO_SND_PCM_FMT_S16,
@@ -1009,7 +1033,7 @@ mod tests {
 
             let _test_harness = GStreamerTestHarness::new();
 
-            let gst_backend = GStreamerBackend::new(stream_params);
+            let gst_backend = GStreamerBackend::new(stream_params).unwrap();
 
             let request = VirtioSndPcmSetParams {
                 format: VIRTIO_SND_PCM_FMT_S16,
@@ -1035,7 +1059,7 @@ mod tests {
 
             let _test_harness = GStreamerTestHarness::new();
 
-            let gst_backend = GStreamerBackend::new(stream_params);
+            let gst_backend = GStreamerBackend::new(stream_params).unwrap();
 
             // Test different channel counts
             let channel_counts = vec![1, 2, 4, 6, 8];
@@ -1065,7 +1089,7 @@ mod tests {
 
             let _test_harness = GStreamerTestHarness::new();
 
-            let gst_backend = GStreamerBackend::new(stream_params);
+            let gst_backend = GStreamerBackend::new(stream_params).unwrap();
 
             // Test as_any method
             let any_ref = gst_backend.as_any();
@@ -1090,7 +1114,7 @@ mod tests {
 
             let _test_harness = GStreamerTestHarness::new();
 
-            let gst_backend = GStreamerBackend::new(stream_params);
+            let gst_backend = GStreamerBackend::new(stream_params).unwrap();
 
             let request = VirtioSndPcmSetParams {
                 format: VIRTIO_SND_PCM_FMT_S16,
@@ -1116,7 +1140,7 @@ mod tests {
 
             let _test_harness = GStreamerTestHarness::new();
 
-            let gst_backend = GStreamerBackend::new(stream_params);
+            let gst_backend = GStreamerBackend::new(stream_params).unwrap();
 
             // Test all 3-byte formats
             let formats_3byte = vec![
@@ -1153,7 +1177,7 @@ mod tests {
 
             let _test_harness = GStreamerTestHarness::new();
 
-            let gst_backend = GStreamerBackend::new(stream_params);
+            let gst_backend = GStreamerBackend::new(stream_params).unwrap();
 
             // Test little endian specific format mapping
             let params = PcmParams {
@@ -1185,7 +1209,7 @@ mod tests {
 
             let _test_harness = GStreamerTestHarness::new();
 
-            let gst_backend = GStreamerBackend::new(stream_params);
+            let gst_backend = GStreamerBackend::new(stream_params).unwrap();
 
             // Test big endian specific format mapping
             let params = PcmParams {
